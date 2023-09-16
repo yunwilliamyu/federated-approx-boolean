@@ -141,7 +141,7 @@ func main() {
 
 	// Check the result
 	res := encoder.DecodeUintNew(ptres)
-	l.Printf("\t%v\n", res[:16])
+	l.Printf("\t%v\n", res[:32])
 	for i := range expRes {
 		if expRes[i] != res[i] {
 			//l.Printf("\t%v\n", expRes)
