@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	//"fmt"
 
 	"github.com/tuneinsight/lattigo/v4/bfv"
 	"github.com/tuneinsight/lattigo/v4/dbfv"
@@ -43,6 +44,7 @@ type party struct {
 	rkgShareOne *drlwe.RKGShare
 	rkgShareTwo *drlwe.RKGShare
 	pcksShare   *drlwe.PCKSShare
+    rtgShare    *drlwe.RTGShare
 
 	input []uint64
 }
@@ -60,6 +62,8 @@ var elapsedCKGCloud time.Duration
 var elapsedCKGParty time.Duration
 var elapsedRKGCloud time.Duration
 var elapsedRKGParty time.Duration
+var elapsedRTGCloud time.Duration
+var elapsedRTGParty time.Duration
 var elapsedPCKSCloud time.Duration
 var elapsedPCKSParty time.Duration
 var elapsedEvalCloudCPU time.Duration
@@ -91,7 +95,7 @@ func main() {
 	}
 
 	// Creating encryption parameters from a default params with logN=14, logQP=438 with a plaintext modulus T=65537
-	paramsDef := bfv.PN14QP438
+	paramsDef := bfv.PN15QP827pq
 	paramsDef.T = 65537
 	params, err := bfv.NewParametersFromLiteral(paramsDef)
 	if err != nil {
@@ -120,14 +124,29 @@ func main() {
 	// 2) Collective relinearization key generation
 	rlk := rkgphase(params, crs, P)
 
+    // 3) Collective rotation keys generation
+    rtk := rtkphase(params, crs, P)
+
 	l.Printf("\tdone (cloud: %s, party: %s)\n",
 		elapsedRKGCloud, elapsedRKGParty)
 	l.Printf("\tSetup done (cloud: %s, party: %s)\n",
-		elapsedRKGCloud+elapsedCKGCloud, elapsedRKGParty+elapsedCKGParty)
+		elapsedRKGCloud+elapsedCKGCloud+elapsedRTGCloud, elapsedRKGParty+elapsedCKGParty+elapsedRTGParty)
 
 	encInputs := encPhase(params, P, pk, encoder)
 
-	encRes := evalPhase(params, NGoRoutine, encInputs, rlk)
+    // Generate a ones vector for addition
+
+	ones_pt := bfv.NewPlaintext(params, params.MaxLevel())
+    onesCt := bfv.NewCiphertext(params, 1, params.MaxLevel())
+    ones_input := make([]uint64, params.N())
+    for i := range ones_input {
+        ones_input[i] = 1
+    }
+    encoder.Encode(ones_input, ones_pt)
+	encryptor := bfv.NewEncryptor(params, pk)
+    encryptor.Encrypt(ones_pt, onesCt)
+
+	encRes := evalPhase(params, NGoRoutine, encInputs, rlk, rtk, onesCt)
 
 	encOut := pcksPhase(params, tpk, encRes, P)
 
@@ -141,7 +160,8 @@ func main() {
 
 	// Check the result
 	res := encoder.DecodeUintNew(ptres)
-	l.Printf("\t%v\n", res[:32])
+	l.Printf("\t%v\n", res[:16])
+	l.Printf("\t%v\n", len(res))
 	for i := range expRes {
 		if expRes[i] != res[i] {
 			//l.Printf("\t%v\n", expRes)
@@ -183,9 +203,9 @@ func encPhase(params bfv.Parameters, P []*party, pk *rlwe.PublicKey, encoder bfv
 	return
 }
 
-func evalPhase(params bfv.Parameters, NGoRoutine int, encInputs []*rlwe.Ciphertext, rlk *rlwe.RelinearizationKey) (encRes *rlwe.Ciphertext) {
-
-	l := log.New(os.Stderr, "", 0)
+func evalPhase(params bfv.Parameters, NGoRoutine int, encInputs []*rlwe.Ciphertext, rlk *rlwe.RelinearizationKey, rtk *rlwe.RotationKeySet, onesCt *rlwe.Ciphertext) (encRes *rlwe.Ciphertext) {
+    // We ignore NGoRoutine and write a single-threaded version
+    l := log.New(os.Stderr, "", 0)
 
 	encLvls := make([][]*rlwe.Ciphertext, 0)
 	encLvls = append(encLvls, encInputs)
@@ -198,59 +218,31 @@ func evalPhase(params bfv.Parameters, NGoRoutine int, encInputs []*rlwe.Cipherte
 	}
 	encRes = encLvls[len(encLvls)-1][0]
 
-	evaluator := bfv.NewEvaluator(params, rlwe.EvaluationKey{Rlk: rlk, Rtks: nil})
-	// Split the task among the Go routines
-	tasks := make(chan *multTask)
-	workers := &sync.WaitGroup{}
-	workers.Add(NGoRoutine)
-	//l.Println("> Spawning", NGoRoutine, "evaluator goroutine")
-	for i := 1; i <= NGoRoutine; i++ {
-		go func(i int) {
-			evaluator := evaluator.ShallowCopy() // creates a shallow evaluator copy for this goroutine
-			for task := range tasks {
-				task.elapsedmultTask = runTimed(func() {
-					// 1) Multiplication of two input vectors
-					evaluator.Mul(task.op1, task.op2, task.res)
-					// 2) Relinearization
-					evaluator.Relinearize(task.res, task.res)
-				})
-				task.wg.Done()
-			}
-			//l.Println("\t evaluator", i, "down")
-			workers.Done()
-		}(i)
-		//l.Println("\t evaluator", i, "started")
-	}
+	evaluator := bfv.NewEvaluator(params, rlwe.EvaluationKey{Rlk: rlk, Rtks: rtk})
 
-	// Start the tasks
-	taskList := make([]*multTask, 0)
-	l.Println("> Eval Phase")
-	elapsedEvalCloud = runTimed(func() {
-		for i, lvl := range encLvls[:len(encLvls)-1] {
-			nextLvl := encLvls[i+1]
-			l.Println("\tlevel", i, len(lvl), "->", len(nextLvl))
-			wg := &sync.WaitGroup{}
-			wg.Add(len(nextLvl))
-			for j, nextLvlCt := range nextLvl {
-				task := multTask{wg, lvl[2*j], lvl[2*j+1], nextLvlCt, 0}
-				taskList = append(taskList, &task)
-				tasks <- &task
-			}
-			wg.Wait()
-		}
-	})
-	elapsedEvalCloudCPU = time.Duration(0)
-	for _, t := range taskList {
-		elapsedEvalCloudCPU += t.elapsedmultTask
-	}
+    l.Println("> Eval Phase")
+    elapsedEvalCloud = runTimed(func() {
+        for i, lvl := range encLvls[:len(encLvls)-1] {
+            nextLvl := encLvls[i+1]
+            l.Println("\tlevel", i, len(lvl), "->", len(nextLvl))
+            for j, nextLvlCt := range nextLvl {
+                evaluator.Mul(lvl[2*j], lvl[2*j+1], nextLvlCt)
+                evaluator.Relinearize(nextLvlCt, nextLvlCt)
+                //_ = nextLvlCt
+            }
+        }
+    })
+    //var new_val *rlwe.Ciphertext
+    //var new_val2 *rlwe.Ciphertext
+    //evaluator.Add(encRes, encLvls[0][0], encLvls[1][0])
+	evaluator.Neg(encRes, encRes)
+    evaluator.Add(onesCt, encRes, encRes)
+    _ = onesCt
+    evaluator.InnerSum(encRes, encRes)
+
 	elapsedEvalParty = time.Duration(0)
 	l.Printf("\tdone (cloud: %s (wall: %s), party: %s)\n",
-		elapsedEvalCloudCPU, elapsedEvalCloud, elapsedEvalParty)
-
-	//l.Println("> Shutting down workers")
-	close(tasks)
-	workers.Wait()
-
+		elapsedEvalCloud, elapsedEvalCloud, elapsedEvalParty)
 	return
 }
 
@@ -270,22 +262,28 @@ func genparties(params bfv.Parameters, N int) []*party {
 
 func genInputs(params bfv.Parameters, P []*party) (expRes []uint64) {
 
-	expRes = make([]uint64, params.N())
+    size_vector := params.N()
+    //size_vector := 16384
+	expRes = make([]uint64, size_vector)
 	for i := range expRes {
 		expRes[i] = 1
 	}
 
 	for _, pi := range P {
+        //fmt.Println(size_vector)
 
-		pi.input = make([]uint64, params.N())
+		pi.input = make([]uint64, size_vector)
 		for i := range pi.input {
 			if utils.RandFloat64(0, 1) > 0.3 || i == 4 {
 				pi.input[i] = 1
 			}
 			expRes[i] *= pi.input[i]
 		}
+        //fmt.Println("pi.input", pi.input)
+        //fmt.Println("expRes", expRes)
 
 	}
+    //fmt.Println("expRes", expRes)
 
 	return
 }
@@ -401,4 +399,43 @@ func ckgphase(params bfv.Parameters, crs utils.PRNG, P []*party) *rlwe.PublicKey
 	l.Printf("\tdone (cloud: %s, party: %s)\n", elapsedCKGCloud, elapsedCKGParty)
 
 	return pk
+}
+
+func rtkphase(params bfv.Parameters, crs utils.PRNG, P []*party) *rlwe.RotationKeySet {
+
+	l := log.New(os.Stderr, "", 0)
+
+	l.Println("> RTG Phase")
+
+	rtg := dbfv.NewRTGProtocol(params) // Rotation keys generation
+
+	for _, pi := range P {
+		pi.rtgShare = rtg.AllocateShare()
+	}
+
+	galEls := params.GaloisElementsForRowInnerSum()
+	rotKeySet := rlwe.NewRotationKeySet(params.Parameters, galEls)
+
+	for _, galEl := range galEls {
+
+		rtgShareCombined := rtg.AllocateShare()
+
+		crp := rtg.SampleCRP(crs)
+
+		elapsedRTGParty += runTimedParty(func() {
+			for _, pi := range P {
+				rtg.GenShare(pi.sk, galEl, crp, pi.rtgShare)
+			}
+		}, len(P))
+
+		elapsedRTGCloud += runTimed(func() {
+			for _, pi := range P {
+				rtg.AggregateShares(pi.rtgShare, rtgShareCombined, rtgShareCombined)
+			}
+			rtg.GenRotationKey(rtgShareCombined, crp, rotKeySet.Keys[galEl])
+		})
+	}
+	l.Printf("\tdone (cloud: %s, party %s)\n", elapsedRTGCloud, elapsedRTGParty)
+
+	return rotKeySet
 }
