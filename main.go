@@ -9,7 +9,11 @@ import (
 	"strconv"
 	"sync"
 	"time"
+    "github.com/bradfitz/iter"
 	//"fmt"
+    //"bufio"
+    "io/ioutil"
+    //"strings"
 
 	"github.com/tuneinsight/lattigo/v4/bfv"
 	"github.com/tuneinsight/lattigo/v4/dbfv"
@@ -46,7 +50,7 @@ type party struct {
 	pcksShare   *drlwe.PCKSShare
     rtgShare    *drlwe.RTGShare
 
-	input []uint64
+	input [][]uint64
 }
 type multTask struct {
 	wg              *sync.WaitGroup
@@ -76,23 +80,36 @@ func main() {
 
 	l := log.New(os.Stderr, "", 0)
 
-	// $go run main.go arg1 arg2
-	// arg1: number of parties
-	// arg2: number of Go routines
+	// $go run main.go arg1 arg2 arg3
+    // arg1: either "union" or "intersection"
+	// arg2: number of parties
+	// arg3: number of conditions
+    // arg4: filename of sample text file in 0/1 textfile format
+
+    compute_union := true // Default compute union
+    if len(os.Args[1:]) >= 1 {
+        if string(os.Args[1][0]) == "i" {compute_union = false }
+    }
 
 	// Largest for n=8192: 512 parties
 	N := 8 // Default number of parties
 	var err error
-	if len(os.Args[1:]) >= 1 {
-		N, err = strconv.Atoi(os.Args[1])
+	if len(os.Args[1:]) >= 2 {
+		N, err = strconv.Atoi(os.Args[2])
 		check(err)
 	}
 
-	NGoRoutine := 1 // Default number of Go routines
-	if len(os.Args[1:]) >= 2 {
-		NGoRoutine, err = strconv.Atoi(os.Args[2])
+	NConditions := 1 // Default number conditions
+	if len(os.Args[1:]) >= 3 {
+		NConditions, err = strconv.Atoi(os.Args[3])
 		check(err)
 	}
+
+    sample_fn := "" // Default is empty string
+    if len(os.Args[1:]) >= 4 {
+        sample_fn = os.Args[4]
+    }
+
 
 	// Creating encryption parameters from a default params with logN=14, logQP=438 with a plaintext modulus T=65537
 	paramsDef := bfv.PN15QP827pq
@@ -116,7 +133,13 @@ func main() {
 	P := genparties(params, N)
 
 	// Inputs & expected result
-	expRes := genInputs(params, P)
+    expRes := 0
+    if sample_fn == "" {
+        expRes = genInputs(params, P, NConditions)
+    } else {
+        expRes = readInputs(params, P, NConditions, sample_fn)
+    }
+    _ = expRes
 
 	// 1) Collective public key generation
 	pk := ckgphase(params, crs, P)
@@ -132,21 +155,24 @@ func main() {
 	l.Printf("\tSetup done (cloud: %s, party: %s)\n",
 		elapsedRKGCloud+elapsedCKGCloud+elapsedRTGCloud, elapsedRKGParty+elapsedCKGParty+elapsedRTGParty)
 
-	encInputs := encPhase(params, P, pk, encoder)
+	encInputs_party_first := encPhase(params, P, pk, encoder, NConditions)
 
-    // Generate a ones vector for addition
+    // Ciphertext of all ones
+    onesCt := onesVec(params, pk, encoder)
 
-	ones_pt := bfv.NewPlaintext(params, params.MaxLevel())
-    onesCt := bfv.NewCiphertext(params, 1, params.MaxLevel())
-    ones_input := make([]uint64, params.N())
-    for i := range ones_input {
-        ones_input[i] = 1
+    // Switch inner/outer loops of encInputs
+    // Before: Party -> Condition -> Vector
+    // After:  Condition -> Party -> Vector
+    encInputs_condition_first := make([][]*rlwe.Ciphertext, NConditions)
+    for i := range(encInputs_condition_first) {
+        encInputs_condition_first[i] = make([]*rlwe.Ciphertext, len(P))
+        for j := range encInputs_condition_first[i] {
+            encInputs_condition_first[i][j] = encInputs_party_first[j][i]
+        }
     }
-    encoder.Encode(ones_input, ones_pt)
-	encryptor := bfv.NewEncryptor(params, pk)
-    encryptor.Encrypt(ones_pt, onesCt)
+    encInputs := encInputs_condition_first
 
-	encRes := evalPhase(params, NGoRoutine, encInputs, rlk, rtk, onesCt)
+	encRes := evalPhase(params, NConditions, encInputs, rlk, rtk, onesCt, compute_union)
 
 	encOut := pcksPhase(params, tpk, encRes, P)
 
@@ -157,32 +183,36 @@ func main() {
 	elapsedDecParty := runTimed(func() {
 		decryptor.Decrypt(encOut, ptres)
 	})
+    _ = elapsedDecParty
 
 	// Check the result
 	res := encoder.DecodeUintNew(ptres)
-	l.Printf("\t%v\n", res[:16])
-	l.Printf("\t%v\n", len(res))
-	for i := range expRes {
-		if expRes[i] != res[i] {
-			//l.Printf("\t%v\n", expRes)
-			l.Println("\tincorrect")
-			return
-		}
-	}
-	l.Println("\tcorrect")
-	l.Printf("> Finished (total cloud: %s, total party: %s)\n",
-		elapsedCKGCloud+elapsedRKGCloud+elapsedEncryptCloud+elapsedEvalCloud+elapsedPCKSCloud,
-		elapsedCKGParty+elapsedRKGParty+elapsedEncryptParty+elapsedEvalParty+elapsedPCKSParty+elapsedDecParty)
+    ans := int(res[0])
+    //l.Printf("\t%v\n", res[:16])
+    l.Printf("\t%v\n", ans)
+	//l.Printf("\t%v\n", len(res))
+    //if expRes != ans {
+        //l.Printf("\t%v\n", expRes)
+        //l.Println("\tincorrect")
+        //return
+    //}
+	//l.Println("\tcorrect")
+	//l.Printf("> Finished (total cloud: %s, total party: %s)\n",
+	//	elapsedCKGCloud+elapsedRKGCloud+elapsedEncryptCloud+elapsedEvalCloud+elapsedPCKSCloud,
+	//	elapsedCKGParty+elapsedRKGParty+elapsedEncryptParty+elapsedEvalParty+elapsedPCKSParty+elapsedDecParty)
 
 }
 
-func encPhase(params bfv.Parameters, P []*party, pk *rlwe.PublicKey, encoder bfv.Encoder) (encInputs []*rlwe.Ciphertext) {
+func encPhase(params bfv.Parameters, P []*party, pk *rlwe.PublicKey, encoder bfv.Encoder, NConditions int) (encInputs [][]*rlwe.Ciphertext) {
 
 	l := log.New(os.Stderr, "", 0)
 
-	encInputs = make([]*rlwe.Ciphertext, len(P))
+	encInputs = make([][]*rlwe.Ciphertext, len(P))
 	for i := range encInputs {
-		encInputs[i] = bfv.NewCiphertext(params, 1, params.MaxLevel())
+        encInputs[i] = make([]*rlwe.Ciphertext, NConditions)
+        for j := range encInputs[i] {
+            encInputs[i][j] = bfv.NewCiphertext(params, 1, params.MaxLevel())
+        }
 	}
 
 	// Each party encrypts its input vector
@@ -192,8 +222,10 @@ func encPhase(params bfv.Parameters, P []*party, pk *rlwe.PublicKey, encoder bfv
 	pt := bfv.NewPlaintext(params, params.MaxLevel())
 	elapsedEncryptParty = runTimedParty(func() {
 		for i, pi := range P {
-			encoder.Encode(pi.input, pt)
-			encryptor.Encrypt(pt, encInputs[i])
+            for j, pi_i := range pi.input {
+                encoder.Encode(pi_i, pt)
+                encryptor.Encrypt(pt, encInputs[i][j])
+            }
 		}
 	}, len(P))
 
@@ -203,46 +235,121 @@ func encPhase(params bfv.Parameters, P []*party, pk *rlwe.PublicKey, encoder bfv
 	return
 }
 
-func evalPhase(params bfv.Parameters, NGoRoutine int, encInputs []*rlwe.Ciphertext, rlk *rlwe.RelinearizationKey, rtk *rlwe.RotationKeySet, onesCt *rlwe.Ciphertext) (encRes *rlwe.Ciphertext) {
-    // We ignore NGoRoutine and write a single-threaded version
+func onesVec(params bfv.Parameters, pk *rlwe.PublicKey, encoder bfv.Encoder) (onesCt *rlwe.Ciphertext) {
+    // Generate a ones ciphertext vector for addition
+
+	ones_pt := bfv.NewPlaintext(params, params.MaxLevel())
+    onesCt = bfv.NewCiphertext(params, 1, params.MaxLevel())
+    ones_input := make([]uint64, params.N())
+    for i := range ones_input {
+        ones_input[i] = 1
+    }
+    encoder.Encode(ones_input, ones_pt)
+	encryptor := bfv.NewEncryptor(params, pk)
+    encryptor.Encrypt(ones_pt, onesCt)
+    return
+}
+
+func evalPhase(params bfv.Parameters, NConditions int, encInputs [][]*rlwe.Ciphertext, rlk *rlwe.RelinearizationKey, rtk *rlwe.RotationKeySet, onesCt *rlwe.Ciphertext, compute_union bool) (encRes *rlwe.Ciphertext) {
     l := log.New(os.Stderr, "", 0)
 
-	encLvls := make([][]*rlwe.Ciphertext, 0)
-	encLvls = append(encLvls, encInputs)
-	for nLvl := len(encInputs) / 2; nLvl > 0; nLvl = nLvl >> 1 {
-		encLvl := make([]*rlwe.Ciphertext, nLvl)
-		for i := range encLvl {
-			encLvl[i] = bfv.NewCiphertext(params, 2, params.MaxLevel())
-		}
-		encLvls = append(encLvls, encLvl)
-	}
-	encRes = encLvls[len(encLvls)-1][0]
-
-	evaluator := bfv.NewEvaluator(params, rlwe.EvaluationKey{Rlk: rlk, Rtks: rtk})
 
     l.Println("> Eval Phase")
-    elapsedEvalCloud = runTimed(func() {
+    l.Println("NConditions: ", NConditions)
+    evaluator := bfv.NewEvaluator(params, rlwe.EvaluationKey{Rlk: rlk, Rtks: rtk})
+
+    conditions := make([]*rlwe.Ciphertext, 0)
+
+    elapsedEvalCloud := time.Duration(0)
+    for p := range iter.N(NConditions) {
+        l.Println("> > unioning each condition: ", p)
+        encLvls := make([][]*rlwe.Ciphertext, 0)
+        encLvls = append(encLvls, encInputs[p])
+        for nLvl := len(encInputs[p]) / 2; nLvl > 0; nLvl = nLvl >> 1 {
+            encLvl := make([]*rlwe.Ciphertext, nLvl)
+            for i := range encLvl {
+                encLvl[i] = bfv.NewCiphertext(params, 2, params.MaxLevel())
+            }
+            encLvls = append(encLvls, encLvl)
+        }
+        conditions = append(conditions, encLvls[len(encLvls)-1][0])
+        l.Println("Current len conditions: ", len(conditions))
+
+        workCt := make([]*rlwe.Ciphertext, 2)
+        workCt[0] = bfv.NewCiphertext(params, 1, params.MaxLevel())
+        workCt[1] = bfv.NewCiphertext(params, 1, params.MaxLevel())
+        elapsedEvalCloud += runTimed(func() {
+            for i, lvl := range encLvls[:len(encLvls)-1] {
+                nextLvl := encLvls[i+1]
+                l.Println("\tlevel", i, len(lvl), "->", len(nextLvl))
+                for j, nextLvlCt := range nextLvl {
+                    evaluator.Neg(lvl[2*j], workCt[0])
+                    evaluator.Neg(lvl[2*j+1], workCt[1])
+                    evaluator.Add(onesCt, workCt[0], workCt[0])
+                    evaluator.Add(onesCt, workCt[1], workCt[1])
+                    //evaluator.Relinearize(workCt[0], workCt[0])
+                    //evaluator.Relinearize(workCt[1], workCt[1])
+                    evaluator.Mul(workCt[0], workCt[1], nextLvlCt)
+                    evaluator.Relinearize(nextLvlCt, nextLvlCt)
+                    evaluator.Neg(nextLvlCt, nextLvlCt)
+                    evaluator.Add(onesCt, nextLvlCt, nextLvlCt)
+                }
+            }
+        })
+    }
+
+    if compute_union {
+        l.Println("> > unioning all conditions: ")
+    } else {
+        l.Println("> > intersecting all conditions: ")
+    }
+    encLvls := make([][]*rlwe.Ciphertext, 0)
+    encLvls = append(encLvls, conditions)
+    for nLvl := len(conditions) / 2; nLvl > 0; nLvl = nLvl >> 1 {
+        encLvl := make([]*rlwe.Ciphertext, nLvl)
+        for i := range encLvl {
+            encLvl[i] = bfv.NewCiphertext(params, 2, params.MaxLevel())
+        }
+        encLvls = append(encLvls, encLvl)
+    }
+    encRes = encLvls[len(encLvls)-1][0]
+    workCt := make([]*rlwe.Ciphertext, 2)
+    workCt[0] = bfv.NewCiphertext(params, 1, params.MaxLevel())
+    workCt[1] = bfv.NewCiphertext(params, 1, params.MaxLevel())
+    elapsedEvalCloud += runTimed(func() {
         for i, lvl := range encLvls[:len(encLvls)-1] {
             nextLvl := encLvls[i+1]
             l.Println("\tlevel", i, len(lvl), "->", len(nextLvl))
             for j, nextLvlCt := range nextLvl {
-                evaluator.Mul(lvl[2*j], lvl[2*j+1], nextLvlCt)
-                evaluator.Relinearize(nextLvlCt, nextLvlCt)
-                //_ = nextLvlCt
+                if compute_union {
+                    evaluator.Neg(lvl[2*j], workCt[0])
+                    evaluator.Neg(lvl[2*j+1], workCt[1])
+                    evaluator.Add(onesCt, workCt[0], workCt[0])
+                    evaluator.Add(onesCt, workCt[1], workCt[1])
+                    //evaluator.Relinearize(workCt[0], workCt[0])
+                    //evaluator.Relinearize(workCt[1], workCt[1])
+                    evaluator.Mul(workCt[0], workCt[1], nextLvlCt)
+                    evaluator.Relinearize(nextLvlCt, nextLvlCt)
+                    evaluator.Neg(nextLvlCt, nextLvlCt)
+                    evaluator.Add(onesCt, nextLvlCt, nextLvlCt)
+                } else {
+                    //workCt[0] = lvl[2*j]
+                    //workCt[1] = lvl[2*j+1]
+                    evaluator.Mul(lvl[2*j], lvl[2*j+1], nextLvlCt)
+                    evaluator.Relinearize(nextLvlCt, nextLvlCt)
+                }
             }
         }
     })
-    //var new_val *rlwe.Ciphertext
-    //var new_val2 *rlwe.Ciphertext
-    //evaluator.Add(encRes, encLvls[0][0], encLvls[1][0])
-	evaluator.Neg(encRes, encRes)
-    evaluator.Add(onesCt, encRes, encRes)
-    _ = onesCt
+	//evaluator.Neg(encRes, encRes)
+    //evaluator.Add(onesCt, encRes, encRes)
+    //_ = onesCt
+    //evaluator.InnerSum(encRes, encRes)
     evaluator.InnerSum(encRes, encRes)
 
 	elapsedEvalParty = time.Duration(0)
-	l.Printf("\tdone (cloud: %s (wall: %s), party: %s)\n",
-		elapsedEvalCloud, elapsedEvalCloud, elapsedEvalParty)
+	l.Printf("\tdone (cloud: %s, party: %s)\n",
+		elapsedEvalCloud, elapsedEvalParty)
 	return
 }
 
@@ -260,31 +367,54 @@ func genparties(params bfv.Parameters, N int) []*party {
 	return P
 }
 
-func genInputs(params bfv.Parameters, P []*party) (expRes []uint64) {
-
+func readInputs(params bfv.Parameters, P []*party, NConditions int, filename string) (expRes int) {
     size_vector := params.N()
-    //size_vector := 16384
-	expRes = make([]uint64, size_vector)
-	for i := range expRes {
-		expRes[i] = 1
+    expRes = 0
+
+    filebuffer, err := ioutil.ReadFile(filename)
+    if err != nil {
+        os.Exit(1)
+    }
+    inputdata := string(filebuffer)
+    i_buf := 0
+	for _, pi := range P {
+		pi.input = make([][]uint64, NConditions)
+        for i := range pi.input {
+            pi.input[i] = make([]uint64, size_vector)
+            for j := range pi.input[i] {
+                if i_buf<len(inputdata) {
+                    if string(inputdata[i_buf]) == "1" {
+                        pi.input[i][j] = 1
+                    } else if string(inputdata[i_buf]) == "0" {
+                        pi.input[i][j] = 0
+                    } else {
+                        os.Exit(5)
+                    }
+                } else {
+                    os.Exit(1)
+                }
+                i_buf++
+            }
+        }
 	}
+	return
+}
+
+func genInputs(params bfv.Parameters, P []*party, NConditions int) (expRes int) {
+    size_vector := params.N()
+    expRes = 0
 
 	for _, pi := range P {
-        //fmt.Println(size_vector)
-
-		pi.input = make([]uint64, size_vector)
-		for i := range pi.input {
-			if utils.RandFloat64(0, 1) > 0.3 || i == 4 {
-				pi.input[i] = 1
-			}
-			expRes[i] *= pi.input[i]
-		}
-        //fmt.Println("pi.input", pi.input)
-        //fmt.Println("expRes", expRes)
-
+		pi.input = make([][]uint64, NConditions)
+        for i := range pi.input {
+            pi.input[i] = make([]uint64, size_vector)
+            for j := range pi.input[i] {
+                if utils.RandFloat64(0, 1) > 0.3 || i == 4 {
+                    pi.input[i][j] = 1
+                }
+            }
+        }
 	}
-    //fmt.Println("expRes", expRes)
-
 	return
 }
 
