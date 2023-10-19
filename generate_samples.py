@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
+# Call via ./generate_samples.py [num_parties] [num_conditions] [num_buckets]
+
 # Depends on modules mmh3 scikit-learn numpy
 # i.e. pip3 install mmh3 scikit-learn numpy
 
+import sys
+
 # Data structure sizes
-num_buckets = 512
+num_buckets = int(sys.argv[2]) # 512
 num_bitvector = 2**15 
 num_filled = int(num_bitvector**(2/3))
 bitvector_sparsity = num_bitvector / num_filled  # the union should fill at most num_bitvector / bitvector_sparsity
@@ -12,7 +16,8 @@ bitvector_sparsity = num_bitvector / num_filled  # the union should fill at most
 rel_err = 3./2. * (1/num_bitvector)**(1./3.)
 
 # Hospital simulation conditions
-num_hospitals = 16
+#num_hospitals = 16
+num_hospitals = int(sys.argv[1])
 num_patients = 10**5 #(per condition)
 overlap_factor = 2
 seed = 50
